@@ -3,4 +3,12 @@ name = "fili"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "fili"
+path = "src/main.rs"
+
 [dependencies]
+crossterm = "0.28"
+syntect = "5.2"
+anyhow = "1.0"
+shellexpand = "3.1"
