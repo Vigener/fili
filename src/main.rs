@@ -254,7 +254,6 @@ fn redraw(
 // ────────────────────────────────────────────────
 
 fn run() -> Result<()> {
-    // パス修正を適用（.ghq -> ghq）
     let raw_path = "~/ghq/github.com/BurntSushi/ripgrep/crates/core/main.rs";
     let expanded = shellexpand::tilde(raw_path).to_string();
     let source = std::fs::read_to_string(&expanded)
@@ -267,7 +266,6 @@ fn run() -> Result<()> {
 
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
-    // DisableLineWrap でターミナルのネイティブな自動改行を無効化（表示崩れ防止）
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -301,15 +299,15 @@ fn run() -> Result<()> {
             }
 
             Event::Resize(_, _) => {
-                // ウィンドウサイズ変更時に適切に再描画
                 redraw(&mut stdout, &lines, cursor_line, cursor_chunk, &mut viewport_top)?;
             }
 
+            // 単語スキップ (Cmd+→ / Ctrl+→ / Option+→)
             Event::Key(KeyEvent { code: KeyCode::Right, modifiers, .. })
                 if modifiers.contains(KeyModifiers::CONTROL)
-                    || modifiers.contains(KeyModifiers::META) =>
+                    || modifiers.contains(KeyModifiers::META)
+                    || modifiers.contains(KeyModifiers::ALT) =>
             {
-                // 単語スキップ（Ctrl+→ / Cmd+→）
                 if cursor_line >= lines.len() {
                     cursor_line = 0; cursor_chunk = 0; viewport_top = 0;
                     while cursor_line < lines.len() && lines[cursor_line].chunks.is_empty() {
@@ -317,6 +315,7 @@ fn run() -> Result<()> {
                     }
                 } else {
                     advance_cursor(&mut cursor_line, &mut cursor_chunk, &lines);
+                    // 次の単語の先頭（is_word_start == true）に到達するまで進める
                     while cursor_line < lines.len() && !lines[cursor_line].chunks[cursor_chunk].is_word_start {
                         advance_cursor(&mut cursor_line, &mut cursor_chunk, &lines);
                     }
@@ -325,7 +324,6 @@ fn run() -> Result<()> {
             }
 
             Event::Key(_) => {
-                // 1チャンク進む
                 if cursor_line >= lines.len() {
                     cursor_line = 0; cursor_chunk = 0; viewport_top = 0;
                     while cursor_line < lines.len() && lines[cursor_line].chunks.is_empty() {
@@ -341,7 +339,6 @@ fn run() -> Result<()> {
         }
     }
 
-    // 後片付け時に EnableLineWrap を忘れずに戻す
     execute!(stdout, Show, EnableLineWrap, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
