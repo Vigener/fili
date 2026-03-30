@@ -2,242 +2,296 @@ use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    execute,
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    execute, queue,
+    style::Print,
+    terminal::{
+        self, Clear, ClearType, DisableLineWrap, EnableLineWrap, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use std::io::{self, Write};
 use syntect::{
     easy::HighlightLines,
-    highlighting::ThemeSet,
+    highlighting::{Color, Style, ThemeSet},
     parsing::SyntaxSet,
-    util::as_24_bit_terminal_escaped,
+    util::LinesWithEndings,
 };
 
-/// UTF-8の先頭バイトからそのコードポイントのバイト長を返す
+// ────────────────────────────────────────────────
+// データ構造
+// ────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct Chunk {
+    /// ハイライト色付き文字列（改行文字排除済み）
+    highlighted: String,
+    /// グレー表示用の生文字列（改行文字排除済み）
+    plain: String,
+    /// 単語境界（スペース直後の最初の実文字）かどうか
+    is_word_start: bool,
+}
+
+struct Line {
+    chunks: Vec<Chunk>,
+}
+
+// ────────────────────────────────────────────────
+// ユーティリティ
+// ────────────────────────────────────────────────
+
 fn utf8_char_len(b: u8) -> usize {
-    if b & 0b1111_0000 == 0b1111_0000 {
-        4
-    } else if b & 0b1110_0000 == 0b1110_0000 {
-        3
-    } else if b & 0b1100_0000 == 0b1100_0000 {
-        2
+    if b & 0b1111_0000 == 0b1111_0000 { 4 }
+    else if b & 0b1110_0000 == 0b1110_0000 { 3 }
+    else if b & 0b1100_0000 == 0b1100_0000 { 2 }
+    else { 1 }
+}
+
+fn is_whitespace_only(s: &str) -> bool {
+    s.chars().all(|c| c.is_whitespace())
+}
+
+fn style_to_ansi(style: Style, text: &str) -> String {
+    let Color { r, g, b, .. } = style.foreground;
+    format!("\x1b[38;2;{};{};{}m{}\x1b[0m", r, g, b, text)
+}
+
+fn grey(text: &str) -> String {
+    format!("\x1b[38;2;75;75;75m{}\x1b[0m", text)
+}
+
+// キャレット（予測文字の上に重なる半透明なブロックを想定）
+const CARET: &str = "\x1b[38;2;200;200;200m▌\x1b[0m";
+
+fn skip_first_codepoint(s: &str) -> &str {
+    let mut chars = s.chars();
+    if chars.next().is_some() {
+        chars.as_str()
     } else {
-        1
+        ""
     }
 }
 
-/// ANSIエスケープシーケンスを壊さない単位で文字列を分割する。
-/// Rawモード対応のため、改行 \n は \r\n に正規化する。
-fn split_into_chunks(s: &str) -> Vec<String> {
-    let mut chunks: Vec<String> = Vec::new();
-    // Rawモード対応: \n → \r\n に置換（\r\n はそのまま）
-    let normalized = {
-        let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\r' {
-                out.push('\r');
-                if chars.peek() == Some(&'\n') {
-                    out.push('\n');
-                    chars.next();
-                }
-            } else if c == '\n' {
-                out.push('\r');
-                out.push('\n');
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    };
+// ────────────────────────────────────────────────
+// パース・チャンク構築
+// ────────────────────────────────────────────────
 
-    let bytes = normalized.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
+fn split_styled_ranges(ranges: &[(Style, &str)]) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    for &(style, text) in ranges {
+        // Viewport描画ではネイティブの改行を使わないため完全に除去
+        let text = text.replace('\r', "").replace('\n', "");
+        if text.is_empty() { continue; }
 
-    while i < len {
-        if bytes[i] == 0x1b {
-            // ESCシーケンス開始。連続する複数のシーケンスをまとめて消費
-            let mut chunk = String::new();
-            while i < len && bytes[i] == 0x1b {
-                chunk.push('\x1b');
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            let clen = utf8_char_len(bytes[i]);
+            if i + clen > len {
                 i += 1;
-                if i < len && bytes[i] == b'[' {
-                    chunk.push('[');
-                    i += 1;
-                    while i < len && bytes[i] != b'm' {
-                        chunk.push(char::from(bytes[i]));
-                        i += 1;
-                    }
-                    if i < len && bytes[i] == b'm' {
-                        chunk.push('m');
-                        i += 1;
-                    }
-                }
+                continue;
             }
-            // シーケンス直後の印字文字（UTF-8, 1コードポイント）をチャンクに同梱
-            if i < len {
-                // \r\n のペアはまとめて1チャンクにする
-                if bytes[i] == b'\r' {
-                    chunk.push('\r');
-                    i += 1;
-                    if i < len && bytes[i] == b'\n' {
-                        chunk.push('\n');
-                        i += 1;
-                    }
-                } else {
-                    let char_len = utf8_char_len(bytes[i]);
-                    if i + char_len <= len {
-                        if let Ok(c) = std::str::from_utf8(&bytes[i..i + char_len]) {
-                            chunk.push_str(c);
-                            i += char_len;
-                        } else {
-                            i += 1;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            chunks.push(chunk);
-        } else if bytes[i] == b'\r' {
-            // \r\n ペアを1チャンクとして扱う
-            let mut chunk = String::from("\r");
-            i += 1;
-            if i < len && bytes[i] == b'\n' {
-                chunk.push('\n');
-                i += 1;
-            }
-            chunks.push(chunk);
-        } else {
-            // 通常のUTF-8文字
-            let char_len = utf8_char_len(bytes[i]);
-            if i + char_len <= len {
-                if let Ok(c) = std::str::from_utf8(&bytes[i..i + char_len]) {
-                    chunks.push(c.to_string());
-                    i += char_len;
-                } else {
-                    i += 1;
-                }
+            if let Ok(c_str) = std::str::from_utf8(&bytes[i..i + clen]) {
+                result.push((style_to_ansi(style, c_str), c_str.to_string()));
+                i += clen;
             } else {
                 i += 1;
             }
         }
     }
-
-    chunks
+    result
 }
 
-fn build_chunks(source: &str) -> Result<Vec<String>> {
+fn build_lines(source: &str) -> Result<Vec<Line>> {
     let ss = SyntaxSet::load_defaults_newlines();
     let ts = ThemeSet::load_defaults();
-
-    let syntax = ss
-        .find_syntax_by_extension("rs")
-        .context("Rust syntax not found in syntect defaults")?;
-
+    let syntax = ss.find_syntax_by_extension("rs").context("Rust syntax not found")?;
     let theme_names = ["base16-ocean.dark", "base16-mocha.dark", "InspiredGitHub"];
     let theme = theme_names
         .iter()
         .find_map(|name| ts.themes.get(*name))
-        .unwrap_or_else(|| ts.themes.values().next().expect("no themes loaded"));
-
+        .unwrap_or_else(|| ts.themes.values().next().expect("no themes"));
     let mut h = HighlightLines::new(syntax, theme);
-    let mut raw_chunks: Vec<String> = Vec::new();
 
-    for line in syntect::util::LinesWithEndings::from(source) {
-        let ranges = h
-            .highlight_line(line, &ss)
-            .context("highlight_line failed")?;
-        let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
-        let line_str = format!("{}\x1b[0m", escaped);
-        raw_chunks.extend(split_into_chunks(&line_str));
-    }
+    let mut lines = Vec::new();
 
-    // --- 空白チャンクを直後の実文字チャンクに結合する ---
-    // 「空白のみ」かどうかを判定するヘルパー
-    // ANSIエスケープを除去した上で空白・改行だけかチェックする
-    fn is_whitespace_chunk(s: &str) -> bool {
-        // \x1b[...m を除去して残った文字が全て空白かどうか
-        let mut in_escape = false;
-        let mut has_visible = false;
-        for c in s.chars() {
-            if c == '\x1b' {
-                in_escape = true;
-                continue;
-            }
-            if in_escape {
-                if c == 'm' {
-                    in_escape = false;
-                }
-                continue;
-            }
-            // エスケープ外の文字
-            if !c.is_whitespace() {
-                has_visible = true;
-                break;
+    for line_str in LinesWithEndings::from(source) {
+        let ranges = h.highlight_line(line_str, &ss).context("highlight failed")?;
+        let raw_chunks = split_styled_ranges(&ranges);
+
+        let mut chunks = Vec::new();
+        let mut pending_hi = String::new();
+        let mut pending_pl = String::new();
+        let mut prev_was_space = true;
+
+        for (hi, pl) in raw_chunks {
+            if is_whitespace_only(&pl) {
+                pending_hi.push_str(&hi);
+                pending_pl.push_str(&pl);
+                prev_was_space = true;
+            } else {
+                chunks.push(Chunk {
+                    highlighted: format!("{}{}", pending_hi, hi),
+                    plain: format!("{}{}", pending_pl, pl),
+                    is_word_start: prev_was_space,
+                });
+                pending_hi.clear();
+                pending_pl.clear();
+                prev_was_space = false;
             }
         }
-        !has_visible
-    }
 
-    // 空白チャンクを「次の実文字チャンクの先頭」に結合する
-    let mut merged: Vec<String> = Vec::new();
-    let mut pending = String::new(); // 空白チャンクの蓄積バッファ
-
-    for chunk in raw_chunks {
-        if is_whitespace_chunk(&chunk) {
-            // 空白系はそのまま蓄積
-            pending.push_str(&chunk);
-        } else {
-            // 実文字チャンクが来たら、蓄積した空白を先頭に結合して追加
-            let mut combined = pending.clone();
-            combined.push_str(&chunk);
-            merged.push(combined);
-            pending.clear();
+        if !pending_hi.is_empty() {
+            if let Some(last) = chunks.last_mut() {
+                last.highlighted.push_str(&pending_hi);
+                last.plain.push_str(&pending_pl);
+            } else {
+                // インデントだけの空行
+                chunks.push(Chunk {
+                    highlighted: pending_hi,
+                    plain: pending_pl,
+                    is_word_start: false,
+                });
+            }
         }
-    }
-    // 末尾に空白だけ残った場合は最後のチャンクに追加（または捨てる）
-    if !pending.is_empty() && !merged.is_empty() {
-        if let Some(last) = merged.last_mut() {
-            last.push_str(&pending);
-        }
+
+        lines.push(Line { chunks });
     }
 
-    Ok(merged)
+    Ok(lines)
 }
 
+// ────────────────────────────────────────────────
+// 状態管理
+// ────────────────────────────────────────────────
+
+fn advance_cursor(cline: &mut usize, cchunk: &mut usize, lines: &[Line]) {
+    if *cline >= lines.len() { return; }
+    *cchunk += 1;
+    if *cchunk >= lines[*cline].chunks.len() {
+        *cline += 1;
+        *cchunk = 0;
+        // 入力不要な完全な空行をスキップ
+        while *cline < lines.len() && lines[*cline].chunks.is_empty() {
+            *cline += 1;
+        }
+    }
+}
+
+// ────────────────────────────────────────────────
+// 描画 (Viewport パターン)
+// ────────────────────────────────────────────────
+
+fn redraw(
+    stdout: &mut impl Write,
+    lines: &[Line],
+    cursor_line: usize,
+    cursor_chunk: usize,
+    viewport_top: &mut usize,
+) -> Result<()> {
+    let (_, rows) = terminal::size()?;
+    let height = rows as usize;
+
+    // Viewportの追従ロジック：カーソルが画面外に出たらスクロール
+    if cursor_line >= *viewport_top + height {
+        *viewport_top = cursor_line - height + 1;
+    } else if cursor_line < *viewport_top {
+        *viewport_top = cursor_line;
+    }
+
+    queue!(stdout, Hide)?;
+
+    // 画面の高さ分だけ、バッファから行を切り出して描画
+    for r in 0..height {
+        let line_idx = *viewport_top + r;
+        queue!(
+            stdout,
+            MoveTo(0, r as u16),
+            Clear(ClearType::CurrentLine)
+        )?;
+
+        if line_idx < lines.len() {
+            let line = &lines[line_idx];
+
+            if line_idx < cursor_line {
+                // 過去行: 全てハイライト色
+                for chunk in &line.chunks {
+                    queue!(stdout, Print(&chunk.highlighted))?;
+                }
+            } else if line_idx == cursor_line {
+                // 現在行: チャンク単位で状態を判定
+                for i in 0..line.chunks.len() {
+                    if i < cursor_chunk {
+                        queue!(stdout, Print(&line.chunks[i].highlighted))?;
+                    } else if i == cursor_chunk {
+                        // キャレット描画位置
+                        let pl = &line.chunks[i].plain;
+                        queue!(stdout, Print(CARET))?;
+                        let rest = skip_first_codepoint(pl);
+                        if !rest.is_empty() {
+                            queue!(stdout, Print(grey(rest)))?;
+                        }
+                    } else {
+                        // 未来チャンク: グレー
+                        queue!(stdout, Print(grey(&line.chunks[i].plain)))?;
+                    }
+                }
+            } else {
+                // 未来行: 全てグレー
+                for chunk in &line.chunks {
+                    queue!(stdout, Print(grey(&chunk.plain)))?;
+                }
+            }
+        }
+    }
+
+    stdout.flush()?;
+    Ok(())
+}
+
+// ────────────────────────────────────────────────
+// メイン処理
+// ────────────────────────────────────────────────
+
 fn run() -> Result<()> {
-    // --- ターゲットファイルの読み込み ---
-    let raw_path =
-        "~/ghq/github.com/BurntSushi/ripgrep/crates/core/main.rs";
+    // パス修正を適用（.ghq -> ghq）
+    let raw_path = "~/ghq/github.com/BurntSushi/ripgrep/crates/core/main.rs";
     let expanded = shellexpand::tilde(raw_path).to_string();
     let source = std::fs::read_to_string(&expanded)
         .with_context(|| format!("Failed to read file: {}", expanded))?;
 
-    // --- シンタックスハイライト済みチャンクの構築 ---
-    let chunks = build_chunks(&source)?;
-    if chunks.is_empty() {
+    let lines = build_lines(&source)?;
+    if lines.is_empty() {
         anyhow::bail!("No content to display.");
     }
 
-    // --- ターミナル初期化 ---
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
+    // DisableLineWrap でターミナルのネイティブな自動改行を無効化（表示崩れ防止）
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        Hide,
+        DisableLineWrap,
+        Clear(ClearType::All)
+    )?;
 
-    // --- メインループ ---
-    let mut idx: usize = 0;
-    let total = chunks.len();
+    let mut cursor_line = 0;
+    let mut cursor_chunk = 0;
+    let mut viewport_top = 0;
+
+    // 初期化時：最初の空行をスキップ
+    while cursor_line < lines.len() && lines[cursor_line].chunks.is_empty() {
+        cursor_line += 1;
+    }
+
+    redraw(&mut stdout, &lines, cursor_line, cursor_chunk, &mut viewport_top)?;
 
     loop {
         let ev = event::read()?;
 
         match ev {
-            // ESC or Ctrl+C で終了
-            Event::Key(KeyEvent {
-                code: KeyCode::Esc, ..
-            })
+            Event::Key(KeyEvent { code: KeyCode::Esc, .. })
             | Event::Key(KeyEvent {
                 code: KeyCode::Char('c'),
                 modifiers: KeyModifiers::CONTROL,
@@ -246,27 +300,49 @@ fn run() -> Result<()> {
                 break;
             }
 
-            // 任意のキーで次の1チャンクを出力
-            Event::Key(_) => {
-                if idx >= total {
-                    // 末尾到達 → 先頭にループ
-                    execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
-                    idx = 0;
-                }
+            Event::Resize(_, _) => {
+                // ウィンドウサイズ変更時に適切に再描画
+                redraw(&mut stdout, &lines, cursor_line, cursor_chunk, &mut viewport_top)?;
+            }
 
-                let chunk = &chunks[idx];
-                // write! を使うことで \r\n がそのままバイト列として送出される
-                write!(stdout, "{}", chunk)?;
-                stdout.flush()?;
-                idx += 1;
+            Event::Key(KeyEvent { code: KeyCode::Right, modifiers, .. })
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    || modifiers.contains(KeyModifiers::META) =>
+            {
+                // 単語スキップ（Ctrl+→ / Cmd+→）
+                if cursor_line >= lines.len() {
+                    cursor_line = 0; cursor_chunk = 0; viewport_top = 0;
+                    while cursor_line < lines.len() && lines[cursor_line].chunks.is_empty() {
+                        cursor_line += 1;
+                    }
+                } else {
+                    advance_cursor(&mut cursor_line, &mut cursor_chunk, &lines);
+                    while cursor_line < lines.len() && !lines[cursor_line].chunks[cursor_chunk].is_word_start {
+                        advance_cursor(&mut cursor_line, &mut cursor_chunk, &lines);
+                    }
+                }
+                redraw(&mut stdout, &lines, cursor_line, cursor_chunk, &mut viewport_top)?;
+            }
+
+            Event::Key(_) => {
+                // 1チャンク進む
+                if cursor_line >= lines.len() {
+                    cursor_line = 0; cursor_chunk = 0; viewport_top = 0;
+                    while cursor_line < lines.len() && lines[cursor_line].chunks.is_empty() {
+                        cursor_line += 1;
+                    }
+                } else {
+                    advance_cursor(&mut cursor_line, &mut cursor_chunk, &lines);
+                }
+                redraw(&mut stdout, &lines, cursor_line, cursor_chunk, &mut viewport_top)?;
             }
 
             _ => {}
         }
     }
 
-    // --- ターミナル後片付け ---
-    execute!(stdout, Show, LeaveAlternateScreen)?;
+    // 後片付け時に EnableLineWrap を忘れずに戻す
+    execute!(stdout, Show, EnableLineWrap, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
     Ok(())
@@ -274,7 +350,7 @@ fn run() -> Result<()> {
 
 fn main() {
     if let Err(e) = run() {
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), Show, EnableLineWrap, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
